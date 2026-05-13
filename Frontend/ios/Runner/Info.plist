@@ -60,9 +60,17 @@
 	<string>We use your location to show nearby people and groups.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>We use photos to let you update your profile and group pictures.</string>
-	<key>NSCameraUsageDescription</key>
-	<string>We use the camera to let you update your profile and group pictures.</string>
-	<key>UISupportedInterfaceOrientations</key>
+    <key>NSCameraUsageDescription</key>
+    <string>We use the camera to let you update your profile and group pictures, and for video calls.</string>
+    <!-- WebRTC: Voice/Video calling permissions -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>We need microphone access for voice calls and audio messages.</string>
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>audio</string>
+        <string>voip</string>
+    </array>
+    <key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>

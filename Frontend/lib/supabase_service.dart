@@ -1,14 +1,11 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter/foundation.dart';
+import 'config.dart';
 
 class SupabaseService {
   static final SupabaseService _instance = SupabaseService._internal();
   factory SupabaseService() => _instance;
   SupabaseService._internal();
-
-  // Supabase credentials from backend/.env
-  static const String supabaseUrl = 'https://hicfazehsmeyobrasaie.supabase.co';
-  static const String supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhpY2ZhemVoc21leW9icmFzYWllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1ODUyMjYsImV4cCI6MjA4OTE2MTIyNn0.FVYlgo16fUAg-hYjSWOufHGf5igiPC9PQ4EUfGog0Hg';
 
   late final SupabaseClient _client;
   bool _isInitialized = false;
@@ -21,9 +18,12 @@ class SupabaseService {
     if (_isInitialized) return;
 
     try {
+      // Load config from environment variables
+      await Config.load();
+      
       await Supabase.initialize(
-        url: supabaseUrl,
-        anonKey: supabaseAnonKey,
+        url: Config.supabaseUrl,
+        anonKey: Config.supabaseAnonKey,
         debug: kDebugMode,
       );
       _client = Supabase.instance.client;
@@ -84,12 +84,16 @@ class SupabaseService {
   Future<UserResponse> updateProfile({
     String? displayName,
     String? avatarUrl,
+    String? username,
+    String? bannerUrl,
   }) async {
     final response = await _client.auth.updateUser(
       UserAttributes(
         data: {
           if (displayName != null) 'display_name': displayName,
           if (avatarUrl != null) 'avatar_url': avatarUrl,
+          if (username != null) 'username': username,
+          if (bannerUrl != null) 'banner_url': bannerUrl,
         },
       ),
     );

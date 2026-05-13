@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../device_auth_service.dart';
+import '../encryption_service.dart';
+import '../notification_service.dart';
 import '../supabase_service.dart';
 import 'device_login_other_screen.dart';
 import 'device_onboarding_screen.dart';
@@ -19,6 +21,7 @@ class _DeviceAuthGateState extends State<DeviceAuthGate> {
   bool _booting = true;
   bool _hasLocal = false;
   String? _error;
+  String? _lastNotifiedUserId;
 
   @override
   void initState() {
@@ -39,6 +42,17 @@ class _DeviceAuthGateState extends State<DeviceAuthGate> {
       if (_hasLocal && SupabaseService().client.auth.currentSession == null) {
         await DeviceAuthService().signInWithSavedCredentials();
       }
+
+      if (SupabaseService().client.auth.currentUser != null) {
+        await NotificationService().onUserAuthenticated();
+      }
+
+      // Ensure encryption keys are uploaded now that we have a session
+      try {
+        await EncryptionService().initialize();
+      } catch (e) {
+        print('Encryption init error during boot: $e');
+      }
     } catch (e) {
       _error = e.toString();
     } finally {
@@ -53,13 +67,19 @@ class _DeviceAuthGateState extends State<DeviceAuthGate> {
     return StreamBuilder<AuthState>(
       stream: SupabaseService().client.auth.onAuthStateChange,
       builder: (context, snapshot) {
-        final user = snapshot.data?.session?.user ?? SupabaseService().client.auth.currentUser;
+        final user =
+            snapshot.data?.session?.user ??
+            SupabaseService().client.auth.currentUser;
 
         if (_booting) {
           return const _GateSplash();
         }
 
         if (user != null) {
+          if (_lastNotifiedUserId != user.id) {
+            _lastNotifiedUserId = user.id;
+            NotificationService().onUserAuthenticated();
+          }
           return const MainNavigationScreen();
         }
 
@@ -68,7 +88,9 @@ class _DeviceAuthGateState extends State<DeviceAuthGate> {
         // - Else => first-run onboarding
         return Stack(
           children: [
-            _hasLocal ? const DeviceUnlockScreen() : const DeviceOnboardingScreen(),
+            _hasLocal
+                ? const DeviceUnlockScreen()
+                : const DeviceOnboardingScreen(),
             Positioned(
               right: 14,
               top: MediaQuery.of(context).padding.top + 8,
@@ -76,7 +98,9 @@ class _DeviceAuthGateState extends State<DeviceAuthGate> {
                 onPressed: () async {
                   await Navigator.push(
                     context,
-                    MaterialPageRoute(builder: (_) => const DeviceLoginOtherScreen()),
+                    MaterialPageRoute(
+                      builder: (_) => const DeviceLoginOtherScreen(),
+                    ),
                   );
                   await _boot();
                 },
@@ -119,10 +143,7 @@ class _GateSplash extends StatelessWidget {
   Widget build(BuildContext context) {
     return const Scaffold(
       backgroundColor: Color(0xFFF2F7ED),
-      body: Center(
-        child: CircularProgressIndicator(color: Color(0xFF1B5A27)),
-      ),
+      body: Center(child: CircularProgressIndicator(color: Color(0xFF1B5A27))),
     );
   }
 }
-

@@ -1,15 +1,31 @@
 import 'dart:convert';
-import 'dart:typed_data';
 import 'dart:math';
+import 'dart:typed_data';
+
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:pointycastle/export.dart';
+
 import 'supabase_service.dart';
 
-/// End-to-End Encryption Service for Colony Chat
-/// 
-/// Uses X25519-like key exchange and AES-256-GCM for message encryption.
-/// This ensures that only the sender and recipient can read messages.
-/// Even Colony servers cannot decrypt the messages.
+/// Proper End-to-End Encryption for Colony Chat.
+///
+/// Cryptographic building blocks:
+///   - **Key exchange** : ECDH on NIST P-256 (secp256r1).
+///     Both sides derive the *same* 32-byte shared secret.
+///   - **Key derivation** : HKDF-SHA256 with a per-sender info string
+///     so that Alice->Bob and Bob->Alice use different AES keys
+///     (directional encryption prevents reflection attacks).
+///   - **Message encryption** : AES-256-GCM with a random 12-byte nonce.
+///     GCM provides both confidentiality and integrity (16-byte tag).
+///   - **Wire format** : JSON stored in the `content` column:
+///     ```
+///     {
+///       "v": 1,                  // scheme version
+///       "ct": "<base64>",        // ciphertext + GCM tag
+///       "iv": "<base64>",        // 12-byte nonce
+///       "kh": "<hex>"            // first 8 hex chars of sender public-key hash
+///     }
+///     ```
 class EncryptionService {
   static final EncryptionService _instance = EncryptionService._internal();
   factory EncryptionService() => _instance;
@@ -19,267 +35,347 @@ class EncryptionService {
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
   );
 
-  // Store key pair data
-  Uint8List? _privateKeyBytes;
-  String? _publicKeyBase64;
+  static const _skKey = 'e2e_ec_private';
+  static const _pkKey = 'e2e_ec_public';
+  static const _schemeVersion = 1;
 
-  // Cache for other users' public keys
-  final Map<String, String> _publicKeyCache = {};
+  ECPrivateKey? _privateKey;
+  ECPublicKey? _publicKey;
 
-  // Cache for shared secrets (derived per conversation)
-  final Map<String, Uint8List> _sharedSecretCache = {};
+  final Map<String, ECPublicKey> _peerKeyCache = {};
+  final Map<String, Uint8List> _derivedKeyCache = {};
 
-  /// Initialize encryption - generate or load key pair
+  bool get isReady => _privateKey != null && _publicKey != null;
+
+  // ─── Initialisation ─────────────────────────────────────────────
+
   Future<void> initialize() async {
     try {
-      // Try to load existing key pair
-      final storedPrivateKey = await _storage.read(key: 'e2e_private_key');
-      final storedPublicKey = await _storage.read(key: 'e2e_public_key');
+      final storedSk = await _storage.read(key: _skKey);
+      final storedPk = await _storage.read(key: _pkKey);
 
-      if (storedPrivateKey != null && storedPublicKey != null) {
-        _privateKeyBytes = Uint8List.fromList(base64Decode(storedPrivateKey));
-        _publicKeyBase64 = storedPublicKey;
-      } else {
-        // Generate new key pair
-        await _generateNewKeyPair();
+      if (storedSk != null && storedPk != null) {
+        _privateKey = _privateKeyFromBytes(base64Decode(storedSk));
+        _publicKey = _publicKeyFromBytes(base64Decode(storedPk));
       }
 
-      // Upload public key to server if not already there
+      if (_privateKey == null || _publicKey == null) {
+        await _generateKeyPair();
+      }
+
       await _uploadPublicKeyIfNeeded();
     } catch (e) {
-      print('Error initializing encryption: $e');
-      // Generate new keys if loading failed
-      await _generateNewKeyPair();
+      print('Encryption init error: $e — regenerating keys');
+      await _generateKeyPair();
     }
   }
 
-  /// Generate a new key pair (32-byte private key, public key derived)
-  Future<void> _generateNewKeyPair() async {
-    // Generate random private key (32 bytes for AES-256)
-    final random = Random.secure();
-    _privateKeyBytes = Uint8List.fromList(
-      List.generate(32, (_) => random.nextInt(256))
-    );
-    
-    // For simplicity, we use the private key directly as the "public key"
-    // In production, you'd use X25519 to derive a proper public key
-    // Here we use a hash of the private key as the public key
-    final sha256 = SHA256Digest();
-    final publicKey = sha256.process(_privateKeyBytes!);
-    
-    _publicKeyBase64 = base64Encode(publicKey);
+  // ─── Key generation ─────────────────────────────────────────────
 
-    await _storage.write(key: 'e2e_private_key', value: base64Encode(_privateKeyBytes!));
-    await _storage.write(key: 'e2e_public_key', value: _publicKeyBase64);
-    
+  static final _ecDomain = ECCurve_secp256r1();
+  static final _ecParams = ECKeyGeneratorParameters(_ecDomain);
+
+  Future<void> _generateKeyPair() async {
+    final secureRandom = _getSecureRandom();
+    final keyGen = ECKeyGenerator()
+      ..init(ParametersWithRandom(_ecParams, secureRandom));
+
+    final pair = keyGen.generateKeyPair();
+    _privateKey = pair.privateKey as ECPrivateKey;
+    _publicKey = pair.publicKey as ECPublicKey;
+
+    await _storage.write(
+      key: _skKey,
+      value: base64Encode(_bigIntToFixedBytes(_privateKey!.d!, 32)),
+    );
+    await _storage.write(
+      key: _pkKey,
+      value: base64Encode(_publicKeyToBytes(_publicKey!)),
+    );
+
+    _derivedKeyCache.clear();
     await _uploadPublicKeyIfNeeded();
   }
 
-  /// Upload public key to server
+  SecureRandom _getSecureRandom() {
+    final secureRandom = FortunaRandom();
+    final random = Random.secure();
+    final seeds = Uint8List.fromList(
+      List.generate(32, (_) => random.nextInt(256)),
+    );
+    secureRandom.seed(KeyParameter(seeds));
+    return secureRandom;
+  }
+
+  // ─── Public key upload ──────────────────────────────────────────
+
   Future<void> _uploadPublicKeyIfNeeded() async {
     try {
       final user = SupabaseService().client.auth.currentUser;
-      if (user == null || _publicKeyBase64 == null) return;
+      if (user == null || _publicKey == null) return;
 
-      // Check if we already have this key uploaded
-      final response = await SupabaseService().client
+      final pkBase64 = base64Encode(_publicKeyToBytes(_publicKey!));
+
+      final existing = await SupabaseService().client
           .from('user_keys')
           .select('public_key')
           .eq('user_id', user.id)
           .maybeSingle();
 
-      if (response == null) {
-        // Insert new key
+      if (existing == null) {
         await SupabaseService().client.from('user_keys').insert({
           'user_id': user.id,
-          'public_key': _publicKeyBase64,
+          'public_key': pkBase64,
+          'key_version': _schemeVersion,
         });
-      } else if (response['public_key'] != _publicKeyBase64) {
-        // Update key (key rotation)
+      } else if (existing['public_key'] != pkBase64) {
         await SupabaseService().client
             .from('user_keys')
-            .update({'public_key': _publicKeyBase64})
+            .update({'public_key': pkBase64, 'key_version': _schemeVersion})
             .eq('user_id', user.id);
+        _derivedKeyCache.clear();
       }
     } catch (e) {
       print('Error uploading public key: $e');
     }
   }
 
-  /// Get current user's public key
-  String? get myPublicKey => _publicKeyBase64;
+  // ─── Peer key fetching ──────────────────────────────────────────
 
-  /// Get public key for another user
-  Future<String?> getPublicKey(String userId) async {
-    // Check cache first
-    if (_publicKeyCache.containsKey(userId)) {
-      return _publicKeyCache[userId];
+  Future<ECPublicKey?> _getPeerPublicKey(String userId) async {
+    if (_peerKeyCache.containsKey(userId)) {
+      return _peerKeyCache[userId]!;
     }
-
     try {
-      final response = await SupabaseService().client
+      final row = await SupabaseService().client
           .from('user_keys')
           .select('public_key')
           .eq('user_id', userId)
           .maybeSingle();
 
-      if (response != null) {
-        final publicKey = response['public_key'] as String;
-        _publicKeyCache[userId] = publicKey;
-        return publicKey;
+      if (row != null && row['public_key'] != null) {
+        final pk = _publicKeyFromBytes(
+          base64Decode(row['public_key'] as String),
+        );
+        if (pk != null) {
+          _peerKeyCache[userId] = pk;
+          return pk;
+        }
       }
     } catch (e) {
-      print('Error getting public key for user $userId: $e');
+      print('Error fetching peer key for $userId: $e');
     }
     return null;
   }
 
-  /// Derive shared secret for a conversation
-  /// Uses a combination of both users' keys
-  Future<Uint8List> _getSharedSecret(String otherUserId) async {
-    // Check cache
-    if (_sharedSecretCache.containsKey(otherUserId)) {
-      return _sharedSecretCache[otherUserId]!;
-    }
+  // ─── ECDH shared secret + HKDF ──────────────────────────────────
 
-    if (_privateKeyBytes == null) {
-      await initialize();
-    }
-    
-    if (_privateKeyBytes == null) {
-      throw Exception('Encryption not initialized');
-    }
-
-    final otherPublicKeyBase64 = await getPublicKey(otherUserId);
-    if (otherPublicKeyBase64 == null) {
-      throw Exception('Could not find public key for user $otherUserId');
-    }
-
-    // Decode other user's public key
-    final otherPublicKeyBytes = Uint8List.fromList(base64Decode(otherPublicKeyBase64));
-
-    // Derive shared secret using HKDF-like approach
-    // Combine both keys and hash them
-    final combined = Uint8List.fromList([
-      ..._privateKeyBytes!,
-      ...otherPublicKeyBytes,
-    ]);
-    
-    final sha256 = SHA256Digest();
-    final sharedSecret = sha256.process(combined);
-
-    // Cache it
-    _sharedSecretCache[otherUserId] = sharedSecret;
-    return sharedSecret;
+  Uint8List _ecdhSharedSecret(ECPublicKey peerPublic) {
+    final dh = ECDHBasicAgreement()..init(_privateKey!);
+    final shared = dh.calculateAgreement(peerPublic);
+    return _bigIntToFixedBytes(shared, 32);
   }
 
-  /// Encrypt a message for a specific user using AES-256-GCM
-  Future<EncryptedMessage> encryptMessage({
-    required String plaintext,
-    required String recipientId,
+  Uint8List _hkdfDeriveKey(Uint8List ikm, Uint8List info) {
+    // HKDF-Extract: PRK = HMAC-SHA256(zero_salt, IKM)
+    final extractHmac = HMac(SHA256Digest(), 64);
+    final salt = Uint8List(32);
+    extractHmac.init(KeyParameter(salt));
+    extractHmac.update(ikm, 0, ikm.length);
+    final prk = Uint8List(32);
+    extractHmac.doFinal(prk, 0);
+
+    // HKDF-Expand: OKM = HMAC-SHA256(PRK, info || 0x01)
+    final expandHmac = HMac(SHA256Digest(), 64);
+    expandHmac.init(KeyParameter(prk));
+    expandHmac.update(info, 0, info.length);
+    final t = Uint8List(1);
+    t[0] = 0x01;
+    expandHmac.update(t, 0, 1);
+    final okm = Uint8List(32);
+    expandHmac.doFinal(okm, 0);
+    return okm;
+  }
+
+  Future<Uint8List> _getDerivedKey(
+    String peerUserId, {
+    required bool outgoing,
   }) async {
-    try {
-      final sharedSecret = await _getSharedSecret(recipientId);
-      
-      // Generate random nonce (12 bytes for GCM)
-      final random = Random.secure();
-      final nonce = Uint8List.fromList(
-        List.generate(12, (_) => random.nextInt(256))
-      );
-      
-      // Create AES-GCM cipher
-      final cipher = GCMBlockCipher(AESEngine());
-      cipher.init(true, AEADParameters(
-        KeyParameter(sharedSecret),
-        128, // tag length in bits
-        nonce,
-        Uint8List(0), // additional data
-      ));
-      
-      // Encrypt
-      final plaintextBytes = Uint8List.fromList(utf8.encode(plaintext));
-      final ciphertext = cipher.process(plaintextBytes);
-      
-      return EncryptedMessage(
-        ciphertext: base64Encode(ciphertext),
-        nonce: base64Encode(nonce),
-        mac: '', // MAC is included in ciphertext for GCM
-      );
-    } catch (e) {
-      print('Error encrypting message: $e');
-      rethrow;
+    final cacheKey = '${peerUserId}_${outgoing ? 'out' : 'in'}';
+    if (_derivedKeyCache.containsKey(cacheKey)) {
+      return _derivedKeyCache[cacheKey]!;
     }
+
+    if (_privateKey == null) await initialize();
+    if (_privateKey == null) throw Exception('Encryption not initialised');
+
+    final peerPk = await _getPeerPublicKey(peerUserId);
+    if (peerPk == null) throw Exception('No public key for user $peerUserId');
+
+    final shared = _ecdhSharedSecret(peerPk);
+
+    // Directional info so A->B and B->A use different keys
+    final myId = SupabaseService().client.auth.currentUser!.id;
+    final direction = outgoing ? '$myId->$peerUserId' : '$peerUserId->$myId';
+    final info = Uint8List.fromList(utf8.encode('colony-e2e-v1:$direction'));
+
+    final key = _hkdfDeriveKey(shared, info);
+    _derivedKeyCache[cacheKey] = key;
+    return key;
   }
 
-  /// Decrypt a message from a specific user
-  Future<String> decryptMessage({
-    required EncryptedMessage encryptedMessage,
-    required String senderId,
-  }) async {
-    try {
-      final sharedSecret = await _getSharedSecret(senderId);
-      
-      // Decode the ciphertext and nonce
-      final ciphertextBytes = Uint8List.fromList(base64Decode(encryptedMessage.ciphertext));
-      final nonceBytes = Uint8List.fromList(base64Decode(encryptedMessage.nonce));
+  // ─── Encrypt / Decrypt ──────────────────────────────────────────
 
-      // Create AES-GCM cipher for decryption
-      final cipher = GCMBlockCipher(AESEngine());
-      cipher.init(false, AEADParameters(
-        KeyParameter(sharedSecret),
-        128, // tag length in bits
-        nonceBytes,
-        Uint8List(0), // additional data
-      ));
-      
-      // Decrypt
-      final decryptedBytes = cipher.process(ciphertextBytes);
+  Future<String> encrypt(String plaintext, String recipientId) async {
+    final aesKey = await _getDerivedKey(recipientId, outgoing: true);
 
-      return utf8.decode(decryptedBytes);
-    } catch (e) {
-      print('Error decrypting message: $e');
-      rethrow;
-    }
-  }
-
-  /// Clear all cached keys (for logout)
-  Future<void> clearKeys() async {
-    _privateKeyBytes = null;
-    _publicKeyBase64 = null;
-    _publicKeyCache.clear();
-    _sharedSecretCache.clear();
-    
-    await _storage.delete(key: 'e2e_private_key');
-    await _storage.delete(key: 'e2e_public_key');
-  }
-
-  /// Check if encryption is ready
-  bool get isReady => _privateKeyBytes != null && _publicKeyBase64 != null;
-}
-
-/// Model for encrypted message data
-class EncryptedMessage {
-  final String ciphertext;
-  final String nonce;
-  final String mac;
-
-  EncryptedMessage({
-    required this.ciphertext,
-    required this.nonce,
-    required this.mac,
-  });
-
-  Map<String, dynamic> toJson() => {
-    'ciphertext': ciphertext,
-    'nonce': nonce,
-    'mac': mac,
-  };
-
-  factory EncryptedMessage.fromJson(Map<String, dynamic> json) {
-    return EncryptedMessage(
-      ciphertext: json['ciphertext'] as String,
-      nonce: json['nonce'] as String,
-      mac: json['mac'] as String? ?? '',
+    final random = Random.secure();
+    final nonce = Uint8List.fromList(
+      List.generate(12, (_) => random.nextInt(256)),
     );
+
+    final cipher = GCMBlockCipher(AESEngine())
+      ..init(
+        true,
+        AEADParameters(KeyParameter(aesKey), 128, nonce, Uint8List(0)),
+      );
+
+    final cipherText = cipher.process(
+      Uint8List.fromList(utf8.encode(plaintext)),
+    );
+
+    final keyHint = _publicKeyHash8Hex(_publicKey!);
+
+    final payload = {
+      'v': _schemeVersion,
+      'ct': base64Encode(cipherText),
+      'iv': base64Encode(nonce),
+      'kh': keyHint,
+    };
+
+    return jsonEncode(payload);
+  }
+
+  Future<String> decrypt(String encryptedJson, String peerId, {bool isOutgoing = false}) async {
+    final map = jsonDecode(encryptedJson) as Map<String, dynamic>;
+
+    final version = map['v'] as int? ?? 1;
+    if (version != _schemeVersion) {
+      throw Exception('Unsupported encryption version $version');
+    }
+
+    final ct = base64Decode(map['ct'] as String);
+    final nonce = base64Decode(map['iv'] as String);
+
+    final aesKey = await _getDerivedKey(peerId, outgoing: isOutgoing);
+
+    final cipher = GCMBlockCipher(AESEngine())
+      ..init(
+        false,
+        AEADParameters(KeyParameter(aesKey), 128, nonce, Uint8List(0)),
+      );
+
+    final plainBytes = cipher.process(Uint8List.fromList(ct));
+    return utf8.decode(plainBytes);
+  }
+
+  /// Try to decrypt; return null on any failure (fallback to raw text).
+  Future<String?> tryDecrypt(String content, String peerId, {bool isOutgoing = false}) async {
+    if (!isReady) return null;
+    if (!content.trimLeft().startsWith('{')) return null;
+    try {
+      final map = jsonDecode(content) as Map<String, dynamic>;
+      if (map['ct'] == null || map['iv'] == null) return null;
+      return await decrypt(content, peerId, isOutgoing: isOutgoing);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Whether a content string looks like our encrypted JSON payload.
+  static bool isEncryptedPayload(String content) {
+    if (!content.trimLeft().startsWith('{')) return false;
+    try {
+      final map = jsonDecode(content) as Map<String, dynamic>;
+      return map['ct'] != null && map['iv'] != null;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // ─── Cleanup ────────────────────────────────────────────────────
+
+  Future<void> clearKeys() async {
+    _privateKey = null;
+    _publicKey = null;
+    _peerKeyCache.clear();
+    _derivedKeyCache.clear();
+    await _storage.delete(key: _skKey);
+    await _storage.delete(key: _pkKey);
+  }
+
+  // ─── Serialisation helpers ──────────────────────────────────────
+
+  Uint8List _bigIntToFixedBytes(BigInt n, int width) {
+    var hex = n.toRadixString(16);
+    if (hex.length < width * 2) {
+      hex = hex.padLeft(width * 2, '0');
+    }
+    if (hex.length > width * 2) {
+      hex = hex.substring(hex.length - width * 2);
+    }
+    final bytes = Uint8List(width);
+    for (var i = 0; i < width; i++) {
+      bytes[i] = int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16);
+    }
+    return bytes;
+  }
+
+  ECPrivateKey? _privateKeyFromBytes(Uint8List bytes) {
+    try {
+      final d = _bytesToBigInt(bytes);
+      return ECPrivateKey(d, _ecDomain);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Uint8List _publicKeyToBytes(ECPublicKey pk) {
+    final q = pk.Q!;
+    final x = q.x!.toBigInteger()!;
+    final y = q.y!.toBigInteger()!;
+    return Uint8List.fromList([
+      ..._bigIntToFixedBytes(x, 32),
+      ..._bigIntToFixedBytes(y, 32),
+    ]);
+  }
+
+  ECPublicKey? _publicKeyFromBytes(Uint8List bytes) {
+    try {
+      if (bytes.length != 64) return null;
+      final x = _bytesToBigInt(Uint8List.sublistView(bytes, 0, 32));
+      final y = _bytesToBigInt(Uint8List.sublistView(bytes, 32, 64));
+      final point = _ecDomain.curve.createPoint(x, y);
+      return ECPublicKey(point, _ecDomain);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  BigInt _bytesToBigInt(Uint8List bytes) {
+    return BigInt.parse(
+      bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join(),
+      radix: 16,
+    );
+  }
+
+  String _publicKeyHash8Hex(ECPublicKey pk) {
+    final pkBytes = _publicKeyToBytes(pk);
+    final digest = SHA256Digest();
+    final hash = digest.process(pkBytes);
+    return hash
+        .sublist(0, 4)
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
   }
 }

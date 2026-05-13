@@ -4,6 +4,7 @@ description: "A new Flutter project."
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 
+
 # The following defines the version and build number for your application.
 # A version number is three numbers separated by dots, like 1.2.43
 # followed by an optional build number separated by a +.
@@ -66,12 +67,46 @@ dependencies:
 
   # HTTP for downloading images for notifications
   http: ^1.1.0
-
+     
   # UUID generation
   uuid: ^4.5.1
 
   # Cryptographic algorithms
   convert: ^3.1.1
+
+  # Environment variables
+  flutter_dotenv: ^5.1.0
+
+  # Voice recording and audio playback
+  record: ^6.2.0
+  audioplayers: ^6.6.0
+  
+  # Emoji picker for reactions
+  emoji_picker_flutter: ^4.4.0
+  
+  # File picker for documents
+  file_picker: ^11.0.2
+  
+  # Path provider for temp files
+  path_provider: ^2.1.1
+  
+  # Path utilities
+  path: ^1.8.3
+
+  # WebSocket for real-time chat
+  web_socket_channel: ^3.0.3
+  socket_io_client: ^3.0.2
+
+  # WebRTC for voice/video calling
+  flutter_webrtc: ^1.4.1
+
+  # Permission handler for camera/microphone
+  permission_handler: ^11.3.0
+
+  # Skeleton loading effects
+  shimmer: ^3.0.0
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
 
 dev_dependencies:
   flutter_test:
@@ -96,7 +131,8 @@ flutter:
   uses-material-design: true
 
   # To add assets to your application, add an assets section, like this:
-  # assets:
+  assets:
+    - .env
   #   - images/a_dot_burr.jpeg
   #   - images/a_dot_ham.jpeg
 

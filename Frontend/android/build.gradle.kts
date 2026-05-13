@@ -5,6 +5,8 @@ allprojects {
     }
 }
 
+
+
 val newBuildDir: Directory = 
     rootProject.layout.buildDirectory
         .dir("../../build")
@@ -28,3 +30,4 @@ tasks.register<Delete>("clean") {
 plugins {
     id("com.google.gms.google-services") version "4.4.0" apply false
 }
+

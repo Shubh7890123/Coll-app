@@ -59,6 +59,7 @@ class _DeviceLoginOtherScreenState extends State<DeviceLoginOtherScreen> {
     return Scaffold(
       backgroundColor: const Color(0xFFF2F7ED),
       appBar: AppBar(
+        toolbarHeight: 50,
         backgroundColor: const Color(0xFFF2F7ED),
         elevation: 0,
         title: const Text('Login on this phone'),
